@@ -1,139 +1,92 @@
-/* ENC28J60 Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-#include <stdio.h>
 #include <string.h>
-#include "sdkconfig.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_eth.h"
-#include "esp_event.h"
-#include "esp_log.h"
+#include "esp_eth_mac.h"
+#include "esp_eth_phy.h"
 #include "driver/gpio.h"
-#include "esp_eth_enc28j60.h"
-#include "driver/spi_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-static const char *TAG = "eth_example";
+#include "plcspi.h"
 
-/** Event handler for Ethernet events 以太网事件的事件处理程序 */
-static void eth_event_handler(void *arg, esp_event_base_t event_base,
-                              int32_t event_id, void *event_data)
+static const char *TAG = "plc-main";
+
+static void eth_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    uint8_t mac_addr[6] = {0};
-    /* we can get the ethernet driver handle from event data 可从事件数据中获得以太网驱动句柄 */
-    esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
-
-    switch (event_id) {
+    esp_eth_handle_t eth = *(esp_eth_handle_t *)arg;
+    uint8_t mac[6] = {0};
+    switch (id) {
     case ETHERNET_EVENT_CONNECTED:
-        esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);//获取 MAC 地址
-        ESP_LOGI(TAG, "Ethernet Link Up");
-        ESP_LOGI(TAG, "Ethernet HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
-                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        esp_eth_ioctl(eth, ETH_CMD_G_MAC_ADDR, mac);
+        ESP_LOGI(TAG, "Link Up, MAC %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
         break;
     case ETHERNET_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "Ethernet Link Down");
+        ESP_LOGI(TAG, "Link Down");
         break;
     case ETHERNET_EVENT_START:
-        ESP_LOGI(TAG, "Ethernet Started");
+        ESP_LOGI(TAG, "Started");
         break;
     case ETHERNET_EVENT_STOP:
-        ESP_LOGI(TAG, "Ethernet Stopped");
+        ESP_LOGI(TAG, "Stopped");
         break;
-    default:
-        break;
+    default: break;
     }
-}
-
-/** Event handler for IP_EVENT_ETH_GOT_IP  IP_EVENT_ETH_GOT_IP 的事件处理程序*/
-static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
-                                 int32_t event_id, void *event_data)
-{
-    ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-    const esp_netif_ip_info_t *ip_info = &event->ip_info;
-
-    ESP_LOGI(TAG, "Ethernet Got IP Address");
-    ESP_LOGI(TAG, "~~~~~~~~~~~");
-    ESP_LOGI(TAG, "ETHIP:" IPSTR, IP2STR(&ip_info->ip));
-    ESP_LOGI(TAG, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
-    ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
-    ESP_LOGI(TAG, "~~~~~~~~~~~");
 }
 
 void app_main(void)
 {
-    // 安装 GPIO 中断服务（因为 SPI-Ethernet 模块为中断驱动）
-    ESP_ERROR_CHECK(gpio_install_isr_service(0));
-    // Initialize TCP/IP network interface (should be called only once in application) 初始化 TCP/IP 网络接口（在应用程序中应仅调用一次）
     ESP_ERROR_CHECK(esp_netif_init());
-    // Create default event loop that running in background 创建一个在后台运行的默认事件循环
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();// 应用以太网的默认网络接口配置
-    esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);// 为以太网驱动程序创建网络接口
+    esp_netif_config_t ifcfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *netif = esp_netif_new(&ifcfg);
 
-    // 配置 SPI 总线
-    spi_bus_config_t buscfg = {
-        .miso_io_num = CONFIG_EXAMPLE_ENC28J60_MISO_GPIO,
-        .mosi_io_num = CONFIG_EXAMPLE_ENC28J60_MOSI_GPIO,
-        .sclk_io_num = CONFIG_EXAMPLE_ENC28J60_SCLK_GPIO,
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
+    ESP_LOGI(TAG, "PLC SPI (RX-only) bring-up start");
+
+    plcspi_config_t plc_cfg = {
+        .spi_host    = SPI2_HOST,
+        .mosi_io_num = 37,
+        .miso_io_num = 36,
+        .sclk_io_num = 38,
+        .cs_io_num   = 35,
+        .irq_io_num  = 7,
+        .rst_io_num  = 6,
+        .dma_chan    = SPI_DMA_CH_AUTO,
+        .clock_hz    = 6 * 1000 * 1000,
+        .mode        = 3,
+        .cs_setup_us = 0,
+        .cs_hold_us  = 0,
+        .queue_size  = 4,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(CONFIG_EXAMPLE_ENC28J60_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    // 配置 SPI 从机设备
-    spi_device_interface_config_t spi_devcfg = {
-        .mode = 0,
-        .clock_speed_hz = CONFIG_EXAMPLE_ENC28J60_SPI_CLOCK_MHZ * 1000 * 1000,
-        .spics_io_num = CONFIG_EXAMPLE_ENC28J60_CS_GPIO,
-        .queue_size = 20,
-        .cs_ena_posttrans = enc28j60_cal_spi_cs_hold_time(CONFIG_EXAMPLE_ENC28J60_SPI_CLOCK_MHZ),
-    };
-    /* ENC28J60 ethernet driver is based on spi driver */
-    eth_enc28j60_config_t enc28j60_config = ETH_ENC28J60_DEFAULT_CONFIG(CONFIG_EXAMPLE_ENC28J60_SPI_HOST, &spi_devcfg);
-    enc28j60_config.int_gpio_num = CONFIG_EXAMPLE_ENC28J60_INT_GPIO;
 
-    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();     // 应用默认的通用 MAC 配置
-    esp_eth_mac_t *mac = esp_eth_mac_new_enc28j60(&enc28j60_config, &mac_config);
+    eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
+    eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
 
-    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();     // 应用默认的 PHY 配置
-    phy_config.autonego_timeout_ms = 0; // ENC28J60 doesn't support auto-negotiation
-    phy_config.reset_gpio_num = -1; // ENC28J60 doesn't have a pin to reset internal PHY
-    esp_eth_phy_t *phy = esp_eth_phy_new_enc28j60(&phy_config);
+    esp_eth_mac_t *mac = esp_eth_mac_new_plcspi(&plc_cfg, &mac_cfg);
+    esp_eth_phy_t *phy = esp_eth_phy_new_plc_dummy(&phy_cfg);
+    assert(mac && phy);
 
-    esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);// 应用默认驱动程序配置
-    esp_eth_handle_t eth_handle = NULL;// 驱动程序安装完毕后，将得到驱动程序的句柄
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));// 安装驱动程序
+    esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_handle_t eth_handle = NULL;
+    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));
 
-    /* ENC28J60 doesn't burn any factory MAC address, we need to set it manually.
-       02:00:00 is a Locally Administered OUI range so should not be used except when testing on a LAN under your control.
-    */
-    mac->set_addr(mac, (uint8_t[]) {
-        0x02, 0x00, 0x00, 0x12, 0x34, 0x56
-    });
+    esp_eth_netif_glue_handle_t glue = esp_eth_new_netif_glue(eth_handle);
+    ESP_ERROR_CHECK(esp_netif_attach(netif, glue));
 
-    // ENC28J60 Errata #1 check
-    if (emac_enc28j60_get_chip_info(mac) < ENC28J60_REV_B5 && CONFIG_EXAMPLE_ENC28J60_SPI_CLOCK_MHZ < 8) {
-        ESP_LOGE(TAG, "SPI frequency must be at least 8 MHz for chip revision less than 5");
-        ESP_ERROR_CHECK(ESP_FAIL);
-    }
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, eth_event_handler, &eth_handle));
 
-    /* attach Ethernet driver to TCP/IP stack  将以太网驱动程序连接至 TCP/IP 协议栈 */
-    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
-    // Register user defined event handers 注册以太网事件处理程序（用于在发生 link up/down 等事件时，处理特定的用户相关内容）
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL)); // 注册用户定义的 IP 事件处理程序
+    uint8_t mymac[6] = {0x02,0x00,0xDE,0xAD,0xBE,0xEF};
+    ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, mymac));
+    ESP_LOGI(TAG, "%02x:%02x:%02x:%02x:%02x:%02x", mymac[0],mymac[1],mymac[2],mymac[3],mymac[4],mymac[5]);
+    ESP_LOGI(TAG, "ethernet attached");
 
-    /* It is recommended to use ENC28J60 in Full Duplex mode since multiple errata exist to the Half Duplex mode */
-#if CONFIG_EXAMPLE_ENC28J60_DUPLEX_FULL
-    eth_duplex_t duplex = ETH_DUPLEX_FULL;
-    ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_DUPLEX_MODE, &duplex));
-#endif
-
-    /* start Ethernet driver state machine 启动以太网驱动程序状态机 */
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_LOGI(TAG, "heartbeat");
+    }
 }
