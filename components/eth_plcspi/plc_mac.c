@@ -9,14 +9,33 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "plcspi.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "plc-mac";
 
-/* 私有对象 */
+/* ===== 可开关的定位宏（默认 0，不改变现有行为） ===== */
+#ifndef PLC_RX_TASK_CREATE_IN_INIT
+#define PLC_RX_TASK_CREATE_IN_INIT  0   /* 1=在 init() 里就创建 RX 任务 */
+#endif
+
+#ifndef PLC_FORCE_STARTED_IN_INIT
+#define PLC_FORCE_STARTED_IN_INIT   0   /* 1=在 init() 里强制 started=true（仅用于定位） */
+#endif
+
+/* 让步时间（毫秒），用于避免“INT 高但无帧”的紧密循环鞭打 CPU */
+#ifndef PLC_RX_YIELD_ON_EMPTY_CTR_MS
+#define PLC_RX_YIELD_ON_EMPTY_CTR_MS 40
+#endif
+
+/* 每轮外层循环结束的小让步，阻断极端情况下的零延迟重入 */
+#ifndef PLC_RX_YIELD_AFTER_LOOP_MS
+#define PLC_RX_YIELD_AFTER_LOOP_MS 10
+#endif
+
 typedef struct {
-    esp_eth_mac_t      parent;      /* vtbl 放首位：与 IDF 头一致 */
+    esp_eth_mac_t      parent;      /* vtbl 放首位 */
     esp_eth_mediator_t *mediator;
-    void               *ll;         /* 低层句柄（plc_ll_t*），对外不暴露类型 */
+    void               *ll;         /* 低层句柄 */
     bool                started;
     TaskHandle_t        rx_task;
     uint8_t             mac_addr[6];
@@ -27,100 +46,195 @@ typedef struct {
 #endif
 #define MAC_FROM_PARENT(p) CONTAINER_OF((p), plc_mac_t, parent)
 
-/* ================= RX 任务：上升沿→CTR 长度→DMA 收帧→校验 SOF/DFT→喂栈 ================= */
+/* ================= RX 任务 ================= */
 static void plc_rx_task(void *arg)
 {
     plc_mac_t *m = (plc_mac_t *)arg;
-    ESP_LOGI(TAG, "RX task started");
+    ESP_LOGI(TAG, "RX task started (core=%d, prio=%d, stack~%u)",
+             xPortGetCoreID(), uxTaskPriorityGet(NULL), (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
-    /* 留 1600 + 2 + 2 的空间（以太网最大帧 + SOF + DFT） */
     static uint8_t frame[1600 + DET_SOF_LEN + DET_DFT_LEN];
 
     for (;;) {
-        if (!m->started) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        if (!m->started) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
 
-        /* 等待上升沿（ISR 轻量唤醒） */
+        /* 等待 INT 高电平（底层纯轮询） */
         if (plc_ll_spi_wait_irq(m->ll, 1000) != ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
-        /* 读到 INT 变低为止 */
-        while (plc_ll_spi_int_level(m->ll)) {
-            /* 1) 发送 DET|CTR 获取长度（4 字节） */
-            uint8_t cmd[DET_CMD_LEN] = {
-                (uint8_t)((DET_CMD >> 8) & 0xFF), (uint8_t)(DET_CMD & 0xFF),
-                (uint8_t)((CMD_CTR >> 8) & 0xFF), (uint8_t)(CMD_CTR & 0xFF)
+        for (;;) {
+            /* 1) DET | CTR */
+            uint8_t tx[DET_CMD_LEN] = {
+                (uint8_t)((DET_CMD >> 8) & 0xFF),
+                (uint8_t)(DET_CMD & 0xFF),
+                (uint8_t)((CMD_CTR >> 8) & 0xFF),
+                (uint8_t)(CMD_CTR & 0xFF),
             };
-            if (plc_ll_spi_tx(m->ll, cmd, sizeof(cmd)) != ESP_OK) { vTaskDelay(1); break; }
+            if (plc_ll_spi_tx(m->ll, tx, sizeof(tx)) != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(5)); break; }
 
             uint8_t rsp[DET_CMD_LEN] = {0};
-            if (plc_ll_spi_rx(m->ll, rsp, sizeof(rsp)) != ESP_OK) { vTaskDelay(1); break; }
+            if (plc_ll_spi_rx(m->ll, rsp, sizeof(rsp)) != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(5)); break; }
 
             /* rsp[1] == 0x01 => 有帧；长度 12bit 在 rsp[2:3] */
             uint16_t len = (uint16_t)(((rsp[2] << 8) | rsp[3]) & 0x0FFF);
+
             if (!(rsp[1] == 0x01 && len >= 60 && len <= 1518)) {
-                /* 无帧或非法长度，跳出内层让出 CPU */
-                break;
+                /* 变动点 1：无帧/非法长度时先小憩 5ms 再退出内层，避免鞭打 CPU */
+                vTaskDelay(pdMS_TO_TICKS(PLC_RX_YIELD_ON_EMPTY_CTR_MS));
+                break;  /* 退出内层，回到 wait_irq */
             }
 
             size_t total = (size_t)len + DET_SOF_LEN + DET_DFT_LEN;
-            if (total > sizeof(frame)) { ESP_LOGW(TAG, "too long: %u", (unsigned)len); vTaskDelay(1); break; }
+            if (total > sizeof(frame)) {
+                ESP_LOGW(TAG, "too long: %u", (unsigned)len);
+                vTaskDelay(pdMS_TO_TICKS(5));
+                break;
+            }
 
             /* 2) 一次 DMA 收：SOF(2) + payload(len) + DFT(2) */
-            if (plc_ll_spi_rx(m->ll, frame, total) != ESP_OK) { vTaskDelay(1); break; }
+            if (plc_ll_spi_rx(m->ll, frame, total) != ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                break;
+            }
 
             /* 3) 校验标记 */
             uint16_t sof = (uint16_t)((frame[0] << 8) | frame[1]);
             uint16_t dft = (uint16_t)((frame[total - 2] << 8) | frame[total - 1]);
             if (sof != DET_SOF || dft != DET_DFT) {
                 ESP_LOGW(TAG, "marker bad sof=0x%04x dft=0x%04x len=%u", sof, dft, (unsigned)len);
-                vTaskDelay(pdMS_TO_TICKS(1));
+                vTaskDelay(pdMS_TO_TICKS(5));
                 continue;
             }
 
-            /* 4) 喂上层协议栈：纯 payload */
-            if (m->mediator) {
-                esp_err_t se = m->mediator->stack_input(m->mediator, &frame[DET_SOF_LEN], len);
-                if (se != ESP_OK) ESP_LOGW(TAG, "stack_input=%d len=%u", se, (unsigned)len);
+            /* ✅ 把 payload 拷贝到堆内存，再交给协议栈（栈会 free） */
+            uint8_t *payload = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_8BIT);
+            if (!payload) {
+                ESP_LOGE(TAG, "rx oom len=%u", (unsigned)len);
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            memcpy(payload, &frame[DET_SOF_LEN], len);
+
+            // === 调试打印：以太网头 ===
+            if (len >= 14) {
+                uint8_t *d = payload, *s = payload + 6;
+                uint16_t et = ((uint16_t)payload[12] << 8) | payload[13];
+                ESP_LOGI(TAG, "RX -> netif  dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%04x len=%u",
+                        d[0],d[1],d[2],d[3],d[4],d[5],
+                        s[0],s[1],s[2],s[3],s[4],s[5],
+                        et, (unsigned)len);
             }
 
-            /* 小憩避免死转 */
-            vTaskDelay(pdMS_TO_TICKS(1));
+            /* 4) 喂协议栈：纯 payload（成功则所有权转移；失败我们 free） */
+            esp_err_t se = ESP_FAIL;
+            if (m->mediator) se = m->mediator->stack_input(m->mediator, payload, len);
+            if (se != ESP_OK) {
+                free(payload);
+                ESP_LOGW(TAG, "stack_input=%d len=%u (freed)", se, (unsigned)len);
+            }
         }
 
-        /* INT 已经拉低，重新打开 GPIO 中断 */
-        plc_ll_spi_reenable_irq(m->ll);
-        vTaskDelay(pdMS_TO_TICKS(1));
+        plc_ll_spi_reenable_irq(m->ll); /* 轮询模式 no-op，保留调用不改上层逻辑 */
+
+        /* 变动点 2：每轮外层循环结束后补 1ms 让步，阻断高电平快重入 */
+        vTaskDelay(pdMS_TO_TICKS(PLC_RX_YIELD_AFTER_LOOP_MS));
     }
 }
 
-/* ================= 必要回调（vtbl：严格按 esp_eth_mac_s 顺序） ================= */
-static esp_err_t plc_set_mediator(esp_eth_mac_t *mac, esp_eth_mediator_t *mediator)
-{ MAC_FROM_PARENT(mac)->mediator = mediator; return ESP_OK; }
+/* ================ vtbl & 基础实现 ================= */
+static esp_err_t plc_set_mediator(esp_eth_mac_t *mac, esp_eth_mediator_t *m)
+{ MAC_FROM_PARENT(mac)->mediator = m; return ESP_OK; }
 
 static esp_err_t plc_init(esp_eth_mac_t *mac)
 {
     plc_mac_t *m = MAC_FROM_PARENT(mac);
-    if (m->rx_task == NULL) {
-        if (xTaskCreatePinnedToCore(plc_rx_task, "plc_rx", 4096, m, 3, &m->rx_task, 1) != pdPASS) {
-            return ESP_FAIL;
+    ESP_LOGI(TAG, "mac init");
+
+#if PLC_RX_TASK_CREATE_IN_INIT
+    if (!m->rx_task) {
+        /* 钉到 CPU1 */
+        BaseType_t ok = xTaskCreatePinnedToCore(plc_rx_task, "plc_rx", 4096, m, 1, &m->rx_task, 1);
+        if (ok != pdPASS || m->rx_task == NULL) {
+            ESP_LOGE(TAG, "xTaskCreate in init FAILED");
+            return ESP_ERR_NO_MEM;
         }
+        ESP_LOGI(TAG, "rx task created in init: %p", (void*)m->rx_task);
     }
-    ESP_LOGI(TAG, "init");
+#endif
+
+#if PLC_FORCE_STARTED_IN_INIT
+    m->started = true;
+    ESP_LOGW(TAG, "FORCE started=true in init (for debugging)");
+#endif
+
     return ESP_OK;
 }
 
-static esp_err_t plc_deinit(esp_eth_mac_t *mac) { ESP_LOGI(TAG, "deinit"); return ESP_OK; }
-static esp_err_t plc_start(esp_eth_mac_t *mac)  { MAC_FROM_PARENT(mac)->started = true;  ESP_LOGI(TAG, "start"); return ESP_OK; }
-static esp_err_t plc_stop(esp_eth_mac_t *mac)   { MAC_FROM_PARENT(mac)->started = false; ESP_LOGI(TAG, "stop");  return ESP_OK; }
-
-/* 发送：如果你当前只做 RX，可返回不支持；若要 TX，可在此封装 DET|RTS + 帧 */
-static esp_err_t plc_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t len)
+static esp_err_t plc_deinit(esp_eth_mac_t *mac)
 {
-    (void)mac; (void)buf; (void)len;
-    return ESP_ERR_NOT_SUPPORTED;
+    (void)mac;
+    ESP_LOGI(TAG, "mac deinit");
+    return ESP_OK;
 }
+
+static esp_err_t plc_start(esp_eth_mac_t *mac)
+{
+    plc_mac_t *m = MAC_FROM_PARENT(mac);
+
+    ESP_LOGI(TAG, "mac start() ENTER");
+    size_t free8  = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t free32 = heap_caps_get_free_size(MALLOC_CAP_32BIT);
+    ESP_LOGI(TAG, "heap free 8bit=%u 32bit=%u", (unsigned)free8, (unsigned)free32);
+
+    if (!m->rx_task) {
+        /* 钉到 CPU1 */
+        BaseType_t ok = xTaskCreatePinnedToCore(plc_rx_task, "plc_rx", 4096, m, 1, &m->rx_task, 1);
+        if (ok != pdPASS || m->rx_task == NULL) {
+            ESP_LOGE(TAG, "xTaskCreate plc_rx FAILED (ret=%ld)", (long)ok);
+            return ESP_ERR_NO_MEM;
+        }
+        ESP_LOGI(TAG, "xTaskCreate OK, handle=%p", (void*)m->rx_task);
+    } else {
+        ESP_LOGW(TAG, "plc_rx already exists: handle=%p", (void*)m->rx_task);
+    }
+
+    m->started = true;
+    ESP_LOGI(TAG, "mac start() EXIT");
+    return ESP_OK;
+}
+
+static esp_err_t plc_stop(esp_eth_mac_t *mac)
+{
+    plc_mac_t *m = MAC_FROM_PARENT(mac);
+    m->started = false;
+    ESP_LOGI(TAG, "mac stop");
+    return ESP_OK;
+}
+
+static esp_err_t plc_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length)
+{
+    plc_mac_t *m = MAC_FROM_PARENT(mac);
+    uint8_t det[DET_CMD_LEN] = {
+        (uint8_t)((DET_CMD >> 8) & 0xFF),
+        (uint8_t)(DET_CMD & 0xFF),
+        (uint8_t)((CMD_RTS >> 8) & 0xFF),
+        (uint8_t)(CMD_RTS & 0xFF),
+    };
+    if (plc_ll_spi_tx(m->ll, det, sizeof(det)) != ESP_OK) return ESP_FAIL;
+
+    uint8_t sof[DET_SOF_LEN] = { (uint8_t)(DET_SOF >> 8), (uint8_t)(DET_SOF & 0xFF) };
+    if (plc_ll_spi_tx(m->ll, sof, sizeof(sof)) != ESP_OK) return ESP_FAIL;
+
+    if (plc_ll_spi_tx(m->ll, buf, length) != ESP_OK) return ESP_FAIL;
+
+    uint8_t dft[DET_DFT_LEN] = { (uint8_t)(DET_DFT >> 8), (uint8_t)(DET_DFT & 0xFF) };
+    if (plc_ll_spi_tx(m->ll, dft, sizeof(dft)) != ESP_OK) return ESP_FAIL;
+
+    return ESP_OK;
+}
+
 static esp_err_t plc_transmit_vargs(esp_eth_mac_t *mac, uint32_t argc, va_list args)
 { (void)mac; (void)argc; (void)args; return ESP_ERR_NOT_SUPPORTED; }
 
@@ -155,18 +269,21 @@ static esp_err_t plc_del(esp_eth_mac_t *mac)
 {
     plc_mac_t *m = MAC_FROM_PARENT(mac);
     if (m->rx_task) { vTaskDelete(m->rx_task); m->rx_task = NULL; }
-    plc_ll_spi_destroy(m->ll);
     free(m);
     return ESP_OK;
 }
 
-/* ========== 工厂函数（名字/签名不变，vtbl 严格按头文件顺序填充） ========== */
-esp_eth_mac_t *esp_eth_mac_new_plcspi(const plcspi_config_t *cfg, const eth_mac_config_t *mac_cfg)
+/* ===== 工厂函数 ===== */
+esp_eth_mac_t *esp_eth_mac_new_plcspi(const plcspi_config_t *cfg, const eth_mac_config_t *mac_config)
 {
-    (void)mac_cfg;
+    (void)mac_config;
     plc_mac_t *m = (plc_mac_t *)calloc(1, sizeof(plc_mac_t));
     if (!m) return NULL;
-    if (plc_ll_spi_create(cfg, &m->ll) != ESP_OK) { free(m); return NULL; }
+
+    if (plc_ll_spi_create(cfg, &m->ll) != ESP_OK) {
+        free(m);
+        return NULL;
+    }
 
     m->parent.set_mediator            = plc_set_mediator;
     m->parent.init                    = plc_init;
@@ -190,5 +307,7 @@ esp_eth_mac_t *esp_eth_mac_new_plcspi(const plcspi_config_t *cfg, const eth_mac_
     m->parent.del                     = plc_del;
 
     ESP_LOGI(TAG, "mac vtbl ok");
+    ESP_LOGI(TAG, "vtbl set: start=%p init=%p stop=%p tx=%p",
+             (void*)m->parent.start, (void*)m->parent.init, (void*)m->parent.stop, (void*)m->parent.transmit);
     return &m->parent;
 }

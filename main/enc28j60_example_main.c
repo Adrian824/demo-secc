@@ -57,7 +57,7 @@ void app_main(void)
         .dma_chan    = SPI_DMA_CH_AUTO,
         .clock_hz    = 6 * 1000 * 1000,
         .mode        = 3,
-        .cs_setup_us = 0,
+        .cs_setup_us = 1,
         .cs_hold_us  = 0,
         .queue_size  = 4,
     };
