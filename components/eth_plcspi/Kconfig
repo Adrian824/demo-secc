@@ -1,0 +1,39 @@
+# menu "PLC SPI Ethernet MAC"
+
+# config PLC_SPI_HOST
+#     int "SPI host (2 or 3 on ESP32-S3)"
+#     default 2
+#     range 1 3
+
+# config PLC_SPI_MOSI
+#     int "MOSI GPIO"
+#     default 37
+# config PLC_SPI_MISO
+#     int "MISO GPIO"
+#     default 36
+# config PLC_SPI_SCLK
+#     int "SCLK GPIO"
+#     default 38
+# config PLC_SPI_CS
+#     int "CS GPIO"
+#     default 35
+
+# config PLC_INT_GPIO
+#     int "INT GPIO from PLC"
+#     default 7
+
+# config PLC_RESET_GPIO
+#     int "RESET GPIO to PLC (-1 if not used)"
+#     default 6
+
+# config PLC_SPI_CLOCK_HZ
+#     int "SPI clock (Hz)"
+#     default 6000000
+
+# config PLC_CS2CLK_DELAY_US
+#     int "Delay (us) between CS low and first SCLK"
+#     default 1
+#     help
+#         厂家要求 CS 拉低后 ≥1us 再起时钟，这里用 1us 兜底。
+
+# endmenu

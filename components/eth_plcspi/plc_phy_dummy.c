@@ -26,9 +26,12 @@ static esp_err_t phy_reset_hw(esp_eth_phy_t *p) { (void)p; return ESP_OK; }
 static esp_err_t phy_init(esp_eth_phy_t *p)
 {
     plc_phy_t *phy = PHY_FROM_PARENT(p);
-    eth_link_t link = ETH_LINK_UP;
     if (phy->mediator && phy->mediator->on_state_changed) {
-        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_LINK, &link);
+        // 告诉上层：链路已 UP
+        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_LINK, (void *)ETH_LINK_UP);
+        //（可选）同时把速率/双工也告诉上层，避免 netif 状态不完整
+        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_SPEED, (void *)ETH_SPEED_10M);
+        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_DUPLEX, (void *)ETH_DUPLEX_FULL);
     }
     ESP_LOGI(TAG, "phy dummy init -> LINK UP");
     return ESP_OK;
@@ -41,9 +44,9 @@ static esp_err_t phy_autonego_ctrl(esp_eth_phy_t *p, eth_phy_autoneg_cmd_t cmd, 
 static esp_err_t phy_get_link(esp_eth_phy_t *p)
 {
     plc_phy_t *phy = PHY_FROM_PARENT(p);
-    eth_link_t link = ETH_LINK_UP;
     if (phy->mediator && phy->mediator->on_state_changed) {
-        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_LINK, &link);
+        // 轮询时同样回报 UP（dummy 就一直 UP）
+        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_LINK, (void *)ETH_LINK_UP);
     }
     return ESP_OK;
 }

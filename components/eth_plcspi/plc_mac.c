@@ -213,27 +213,69 @@ static esp_err_t plc_stop(esp_eth_mac_t *mac)
     return ESP_OK;
 }
 
+// plc_mac.c
+
 static esp_err_t plc_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length)
 {
     plc_mac_t *m = MAC_FROM_PARENT(mac);
-    uint8_t det[DET_CMD_LEN] = {
-        (uint8_t)((DET_CMD >> 8) & 0xFF),
-        (uint8_t)(DET_CMD & 0xFF),
-        (uint8_t)((CMD_RTS >> 8) & 0xFF),
-        (uint8_t)(CMD_RTS & 0xFF),
-    };
-    if (plc_ll_spi_tx(m->ll, det, sizeof(det)) != ESP_OK) return ESP_FAIL;
+    if (!m->started) return ESP_ERR_INVALID_STATE;
 
-    uint8_t sof[DET_SOF_LEN] = { (uint8_t)(DET_SOF >> 8), (uint8_t)(DET_SOF & 0xFF) };
-    if (plc_ll_spi_tx(m->ll, sof, sizeof(sof)) != ESP_OK) return ESP_FAIL;
+    // 以太帧按不含 FCS 的常规长度限制
+    if (length < 14 || length > 1518) {
+        ESP_LOGW(TAG, "tx drop: bad len=%u", (unsigned)length);
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    if (plc_ll_spi_tx(m->ll, buf, length) != ESP_OK) return ESP_FAIL;
+    // total_len：帧体需要 pad 到 60B（以太网最小帧，不含 FCS）
+    uint16_t total_len = (length < 60) ? 60 : (uint16_t)length;
 
-    uint8_t dft[DET_DFT_LEN] = { (uint8_t)(DET_DFT >> 8), (uint8_t)(DET_DFT & 0xFF) };
-    if (plc_ll_spi_tx(m->ll, dft, sizeof(dft)) != ESP_OK) return ESP_FAIL;
+    // 组“一口气发送”的缓冲区：SOF(2) + payload(total_len) + DFT(2)
+    const size_t one_shot_len = DET_SOF_LEN + total_len + DET_DFT_LEN;
+    uint8_t *tx = (uint8_t *)heap_caps_malloc(one_shot_len, MALLOC_CAP_8BIT);
+    if (!tx) return ESP_ERR_NO_MEM;
 
+    // SOF
+    tx[0] = (DET_SOF >> 8) & 0xFF;
+    tx[1] = (DET_SOF) & 0xFF;
+
+    // payload（14..length）原样拷贝；若小于 60B，用 0 填充尾部
+    memcpy(&tx[DET_SOF_LEN], buf, length);
+    if (length < 60) {
+        memset(&tx[DET_SOF_LEN + length], 0, 60 - length);
+    }
+
+    // DFT
+    tx[DET_SOF_LEN + total_len + 0] = (DET_DFT >> 8) & 0xFF;
+    tx[DET_SOF_LEN + total_len + 1] = (DET_DFT) & 0xFF;
+
+    // 先 RTS 握手（带上 total_len）
+    esp_err_t err = plc_ll_spi_rts_wait_ctr(m->ll, total_len, /*timeout_ms=*/5);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "tx: RTS/CTR handshake failed (%s)", esp_err_to_name(err));
+        free(tx);
+        return err;
+    }
+
+    // 一次事务把 SOF+payload+DFT 整包发掉（DMA）
+    err = plc_ll_spi_tx(m->ll, tx, one_shot_len);
+    free(tx);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "tx: one-shot payload failed (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    // 可选：打印头部，联调更直观
+    if (length >= 14) {
+        uint8_t *d = buf, *s = buf + 6;
+        uint16_t et = ((uint16_t)buf[12] << 8) | buf[13];
+        ESP_LOGI(TAG, "TX <- netif  dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x type=0x%04x len=%u(padded=%u)",
+                 d[0],d[1],d[2],d[3],d[4],d[5],
+                 s[0],s[1],s[2],s[3],s[4],s[5],
+                 et, (unsigned)length, (unsigned)total_len);
+    }
     return ESP_OK;
 }
+
 
 static esp_err_t plc_transmit_vargs(esp_eth_mac_t *mac, uint32_t argc, va_list args)
 { (void)mac; (void)argc; (void)args; return ESP_ERR_NOT_SUPPORTED; }

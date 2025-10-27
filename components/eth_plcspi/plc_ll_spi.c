@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
+#include "esp_check.h"
 
 static const char *TAG = "plc-ll";
 
@@ -132,6 +133,42 @@ esp_err_t plc_ll_spi_wait_irq(void *h, uint32_t timeout_ms)
             (xTaskGetTickCount() - start) >= pdMS_TO_TICKS(timeout_ms))
             return ESP_ERR_TIMEOUT;                           // 超时
         vTaskDelay(pdMS_TO_TICKS(20));                         // 低→真睡一会
+    }
+}
+
+
+
+// 发送 DET|RTS(len)，并等待回读到 DET|CTR(accept)；超时返回 ESP_ERR_TIMEOUT
+esp_err_t plc_ll_spi_rts_wait_ctr(void *h, uint16_t total_len, uint32_t timeout_ms)
+{
+    plc_ll_t *ll = (plc_ll_t *)h;
+    uint8_t cmd[4];
+    uint8_t rx[4];
+    TickType_t start = xTaskGetTickCount();
+
+    // 组 DET|RTS(len) 4 字节（高字节在前）
+    cmd[0] = (DET_CMD >> 8) & 0xFF;
+    cmd[1] = (DET_CMD) & 0xFF;
+    cmd[2] = ((CMD_RTS | total_len) >> 8) & 0xFF;
+    cmd[3] = ((CMD_RTS | total_len) & 0xFF);
+
+    // 发 RTS
+    ESP_RETURN_ON_ERROR(plc_ll_spi_tx(ll, cmd, sizeof(cmd)), TAG, "RTS tx failed");
+
+    // 轮询回读 CTR
+    for (;;) {
+        // 发 0xAA 0xAA 0xAA 0xAA 占位，读 4 字节状态
+        memset(rx, 0xAA, sizeof(rx));
+        ESP_RETURN_ON_ERROR(plc_ll_spi_txrx(ll, NULL, rx, sizeof(rx)), TAG, "CTR rx failed");
+
+        // 期望: 00 01 20 00  （= DET_CMD, CMD_CTR|0x0000）
+        if (rx[0] == 0x00 && rx[1] == 0x01 && rx[2] == 0x20 && rx[3] == 0x00) {
+            return ESP_OK;
+        }
+        if (timeout_ms && (xTaskGetTickCount() - start) >= pdMS_TO_TICKS(timeout_ms)) {
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 

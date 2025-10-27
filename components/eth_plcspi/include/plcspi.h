@@ -48,5 +48,6 @@ esp_err_t plc_ll_spi_wait_irq(void *ll, uint32_t timeout_ms);
 bool      plc_ll_spi_int_level(void *ll);
 void      plc_ll_spi_reenable_irq(void *ll);
 
+esp_err_t plc_ll_spi_rts_wait_ctr(void *h, uint16_t total_len, uint32_t timeout_ms);
 esp_eth_mac_t *esp_eth_mac_new_plcspi(const plcspi_config_t *cfg, const eth_mac_config_t *mac_config);
 esp_eth_phy_t *esp_eth_phy_new_plc_dummy(const eth_phy_config_t *phy_config);
