@@ -24,7 +24,7 @@ static const char *TAG = "plc-mac";
 
 /* 让步时间（毫秒），用于避免“INT 高但无帧”的紧密循环鞭打 CPU */
 #ifndef PLC_RX_YIELD_ON_EMPTY_CTR_MS
-#define PLC_RX_YIELD_ON_EMPTY_CTR_MS 40
+#define PLC_RX_YIELD_ON_EMPTY_CTR_MS 10
 #endif
 
 /* 每轮外层循环结束的小让步，阻断极端情况下的零延迟重入 */
@@ -248,7 +248,7 @@ static esp_err_t plc_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length)
     tx[DET_SOF_LEN + total_len + 1] = (DET_DFT) & 0xFF;
 
     // 先 RTS 握手（带上 total_len）
-    esp_err_t err = plc_ll_spi_rts_wait_ctr(m->ll, total_len, /*timeout_ms=*/5);
+    esp_err_t err = plc_ll_spi_rts_wait_ctr(m->ll, total_len, /*timeout_ms=*/20);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "tx: RTS/CTR handshake failed (%s)", esp_err_to_name(err));
         free(tx);

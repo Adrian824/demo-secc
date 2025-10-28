@@ -42,7 +42,8 @@ static void eth_event_handler(void *arg, esp_event_base_t base, int32_t id, void
 
 
 void app_main(void)
-{
+{   
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));// 安装 GPIO 中断服务（因为 SPI-Ethernet 模块为中断驱动）
     ESP_ERROR_CHECK(esp_netif_init());// 初始化 TCP/IP 网络接口（在应用程序中应仅调用一次）
     ESP_ERROR_CHECK(esp_event_loop_create_default());// 创建一个在后台运行的默认事件循环
     esp_netif_config_t ifcfg = ESP_NETIF_DEFAULT_ETH();// 应用以太网的默认网络接口配置
@@ -87,7 +88,7 @@ void app_main(void)
     ESP_LOGI(TAG, "ethernet attached");
 
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));// 启动以太网驱动程序状态机
-    vTaskDelay(100);
+    vTaskDelay(pdMS_TO_TICKS(100));
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         ESP_LOGI(TAG, "heartbeat");
