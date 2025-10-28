@@ -10,6 +10,9 @@ typedef struct {
     esp_eth_mediator_t *mediator;
     uint32_t            addr;
     bool                powered;
+    bool                last_link_up;
+    eth_speed_t         last_speed;
+    eth_duplex_t        last_duplex;
 } plc_phy_t;
 
 #ifndef CONTAINER_OF
@@ -26,12 +29,15 @@ static esp_err_t phy_reset_hw(esp_eth_phy_t *p) { (void)p; return ESP_OK; }
 static esp_err_t phy_init(esp_eth_phy_t *p)
 {
     plc_phy_t *phy = PHY_FROM_PARENT(p);
-    if (phy->mediator && phy->mediator->on_state_changed) {
-        // 告诉上层：链路已 UP
-        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_LINK, (void *)ETH_LINK_UP);
-        //（可选）同时把速率/双工也告诉上层，避免 netif 状态不完整
-        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_SPEED, (void *)ETH_SPEED_10M);
-        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_DUPLEX, (void *)ETH_DUPLEX_FULL);
+    if (phy->mediator && phy->mediator->on_state_changed)
+    {
+        if(!phy->last_link_up)
+        {
+            phy->mediator->on_state_changed(phy->mediator, ETH_STATE_LINK, (void *)ETH_LINK_UP);
+            phy->mediator->on_state_changed(phy->mediator, ETH_STATE_SPEED, (void *)ETH_SPEED_10M);
+            phy->mediator->on_state_changed(phy->mediator, ETH_STATE_DUPLEX, (void *)ETH_DUPLEX_FULL);
+            phy->last_link_up = true;
+        }
     }
     ESP_LOGI(TAG, "phy dummy init -> LINK UP");
     return ESP_OK;
@@ -44,9 +50,14 @@ static esp_err_t phy_autonego_ctrl(esp_eth_phy_t *p, eth_phy_autoneg_cmd_t cmd, 
 static esp_err_t phy_get_link(esp_eth_phy_t *p)
 {
     plc_phy_t *phy = PHY_FROM_PARENT(p);
-    if (phy->mediator && phy->mediator->on_state_changed) {
-        // 轮询时同样回报 UP（dummy 就一直 UP）
-        phy->mediator->on_state_changed(phy->mediator, ETH_STATE_LINK, (void *)ETH_LINK_UP);
+    if(phy->mediator && phy->mediator->on_state_changed)
+    {
+        bool now_up = true; // dummy 一直 up
+        if(now_up != phy->last_link_up) 
+        {
+            phy->mediator->on_state_changed(phy->mediator, ETH_STATE_LINK, (void *)(now_up ? ETH_LINK_UP : ETH_LINK_DOWN));
+            phy->last_link_up = now_up;
+        }
     }
     return ESP_OK;
 }
@@ -68,6 +79,10 @@ esp_eth_phy_t *esp_eth_phy_new_plc_dummy(const eth_phy_config_t *phy_config)
     (void)phy_config;
     plc_phy_t *phy = (plc_phy_t *)calloc(1, sizeof(plc_phy_t));
     if (!phy) return NULL;
+
+    phy->last_link_up = false;
+    phy->last_speed   = ETH_SPEED_10M;
+    phy->last_duplex  = ETH_DUPLEX_FULL;
 
     phy->parent.set_mediator               = phy_set_mediator;
     phy->parent.reset                      = phy_reset;

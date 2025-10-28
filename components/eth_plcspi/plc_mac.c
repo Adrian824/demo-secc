@@ -165,6 +165,7 @@ static esp_err_t plc_init(esp_eth_mac_t *mac)
 #endif
 
 #if PLC_FORCE_STARTED_IN_INIT
+    vTaskDelay(pdMS_TO_TICKS(1000));
     m->started = true;
     ESP_LOGW(TAG, "FORCE started=true in init (for debugging)");
 #endif

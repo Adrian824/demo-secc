@@ -49,6 +49,19 @@ void app_main(void)
     esp_netif_config_t ifcfg = ESP_NETIF_DEFAULT_ETH();// 应用以太网的默认网络接口配置
     esp_netif_t *netif = esp_netif_new(&ifcfg);// 为以太网驱动程序创建网络接口
 
+    // 1) 关闭 DHCP 客户端
+    esp_netif_dhcpc_stop(netif);
+
+    // 2) 给桩端设置静态 IPv4（ 192.168.2.1/24）
+    esp_netif_ip_info_t ip = {0};
+    IP4_ADDR(&ip.ip,      192,168,2,1);
+    IP4_ADDR(&ip.gw,      192,168,2,1);
+    IP4_ADDR(&ip.netmask, 255,255,255,0);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &ip));
+
+    // 3) 启动 DHCP 服务器（给车端分配地址）
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(netif));
+
     // SPI 总线配置
     plcspi_config_t plc_cfg = {
         .spi_host    = SPI2_HOST,
