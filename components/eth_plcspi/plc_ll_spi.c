@@ -1,4 +1,3 @@
-// plc_ll_spi.c
 #include "plcspi.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -12,9 +11,6 @@
 
 static const char *TAG = "plc-ll";
 
-#ifndef PLC_LL_WAIT_POLL_MS
-#define PLC_LL_WAIT_POLL_MS 5   // ★ 将1ms改为5ms，必要时可再调大到10/20
-#endif
 typedef struct {
     spi_device_handle_t spi;
     int cs_io, irq_io, rst_io;

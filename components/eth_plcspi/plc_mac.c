@@ -213,7 +213,6 @@ static esp_err_t plc_stop(esp_eth_mac_t *mac)
     return ESP_OK;
 }
 
-// plc_mac.c
 
 static esp_err_t plc_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length)
 {
