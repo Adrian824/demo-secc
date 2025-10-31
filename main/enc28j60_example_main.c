@@ -49,18 +49,18 @@ void app_main(void)
     esp_netif_config_t ifcfg = ESP_NETIF_DEFAULT_ETH();// 应用以太网的默认网络接口配置
     esp_netif_t *netif = esp_netif_new(&ifcfg);// 为以太网驱动程序创建网络接口
 
-    // 1) 关闭 DHCP 客户端
-    esp_netif_dhcpc_stop(netif);
+    // // 1) 关闭 DHCP 客户端
+    // esp_netif_dhcpc_stop(netif);
 
-    // 2) 给桩端设置静态 IPv4（ 192.168.2.1/24）
-    esp_netif_ip_info_t ip = {0};
-    IP4_ADDR(&ip.ip,      192,168,2,1);
-    IP4_ADDR(&ip.gw,      192,168,2,1);
-    IP4_ADDR(&ip.netmask, 255,255,255,0);
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &ip));
+    // // 2) 给桩端设置静态 IPv4（ 192.168.2.1/24）
+    // esp_netif_ip_info_t ip = {0};
+    // IP4_ADDR(&ip.ip,      192,168,2,1);
+    // IP4_ADDR(&ip.gw,      192,168,2,1);
+    // IP4_ADDR(&ip.netmask, 255,255,255,0);
+    // ESP_ERROR_CHECK(esp_netif_set_ip_info(netif, &ip));
 
-    // 3) 启动 DHCP 服务器（给车端分配地址）
-    ESP_ERROR_CHECK(esp_netif_dhcps_start(netif));
+    // // 3) 启动 DHCP 服务器（给车端分配地址）
+    // ESP_ERROR_CHECK(esp_netif_dhcps_start(netif));
 
     // SPI 总线配置
     plcspi_config_t plc_cfg = {
@@ -90,15 +90,14 @@ void app_main(void)
     esp_eth_handle_t eth_handle = NULL;// 驱动程序安装完毕后，将得到驱动程序的句柄
     ESP_ERROR_CHECK(esp_eth_driver_install(&eth_config, &eth_handle));// 安装驱动程序
 
-    esp_eth_netif_glue_handle_t glue = esp_eth_new_netif_glue(eth_handle);
-    ESP_ERROR_CHECK(esp_netif_attach(netif, glue));// 将以太网驱动程序连接至 TCP/IP 协议栈
-
+    // esp_eth_netif_glue_handle_t glue = esp_eth_new_netif_glue(eth_handle);
+    // ESP_ERROR_CHECK(esp_netif_attach(netif, glue));// 将以太网驱动程序连接至 TCP/IP 协议栈
+    //ESP_LOGI(TAG, "ethernet attached");
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, eth_event_handler, &eth_handle));// 注册以太网事件处理程序
 
     uint8_t mymac[6] = {0x02,0x00,0xDE,0xAD,0xBE,0xEF};
     ESP_ERROR_CHECK(esp_eth_ioctl(eth_handle, ETH_CMD_S_MAC_ADDR, mymac));
     ESP_LOGI(TAG, "%02x:%02x:%02x:%02x:%02x:%02x", mymac[0],mymac[1],mymac[2],mymac[3],mymac[4],mymac[5]);
-    ESP_LOGI(TAG, "ethernet attached");
 
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));// 启动以太网驱动程序状态机
     vTaskDelay(pdMS_TO_TICKS(100));
